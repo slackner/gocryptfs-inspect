@@ -33,8 +33,7 @@ def gocryptfs_encrypt(content, masterkey, aessiv):
         fp.write(os.urandom(16))
 
     # Mount cipher -> plain.
-    args = ["gocryptfs"]
-    args.append("-q")
+    args = ["gocryptfs", "-q"]
     if aessiv:
         args.append("-aessiv")
     args.append("-masterkey=%s" % masterkey.hex())
@@ -63,7 +62,8 @@ def gocryptfs_encrypt(content, masterkey, aessiv):
             continue
         if filename == "gocryptfs.conf":
             continue
-        found.append(os.path.join(cipher.name, filename))
+        if not filename.endswith(".name"):
+            found.append(os.path.join(cipher.name, filename))
 
     # We expect to find exactly one file.
     assert len(found) == 1
@@ -157,6 +157,77 @@ class GocryptfsTests(unittest.TestCase):
         self.assertEqual(result, b"It works!\n")
         result = subprocess.check_output(["../gocryptfs.py", "--password=test", "./mGj2_hdnHe34Sp0iIQUwuw"])
         self.assertEqual(result, b"It works!\n")
+
+class GocryptfsDeobfuscateTests(unittest.TestCase):
+    def test_wrong_sock(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            subprocess.check_call(["../gocryptfs-deobfuscate.py", "/does-not-exist"])
+
+    def test_deobfuscate(self):
+        masterkey = os.urandom(32)
+
+        ctlsock = tempfile.NamedTemporaryFile(prefix="gocryptfs-ctlsock-", delete=False)
+        cipher = tempfile.TemporaryDirectory(prefix="gocryptfs-cipher-")
+        plain = tempfile.TemporaryDirectory(prefix="gocryptfs-plain-")
+        os.remove(ctlsock.name)
+
+        # Create .diriv file, otherwise gocryptfs refuses to mount.
+        with open(os.path.join(cipher.name, "gocryptfs.diriv"), "wb") as fp:
+            fp.write(os.urandom(16))
+
+        # Mount cipher -> plain.
+        args = ["gocryptfs", "-q"]
+        args.append("-masterkey=%s" % masterkey.hex())
+        args.append("-ctlsock=%s" % ctlsock.name)
+        args.append(cipher.name)
+        args.append(plain.name)
+        subprocess.check_call(args)
+
+        for i in range(1, 255):
+            with open(os.path.join(plain.name, "x" * i), "wb") as fp:
+                fp.write(b"It works!\n")
+
+            # Find the encrypted version.
+            found = []
+            for filename in os.listdir(cipher.name):
+                if filename == "gocryptfs.diriv":
+                    continue
+                if filename == "gocryptfs.conf":
+                    continue
+                if not filename.endswith(".name"):
+                    found.append(filename)
+
+            # We expect to find exactly one file.
+            assert len(found) == 1
+            filename = found[0]
+
+            testcase = ["gocryptfs.conf",
+                        "gocryptfs.diriv",
+                        "%s" % filename,
+                        "Hello %s!" % filename,
+                        "\"%s\"" % filename,
+                        "a%s" % filename]
+
+            expected = ["<gocryptfs.conf>",
+                        "<gocryptfs.diriv>",
+                        "%s" % ("x" * i),
+                        "Hello %s!" % ("x" * i),
+                        "\"%s\"" % ("x" * i),
+                        "a%s" % filename]
+
+            if filename.startswith("gocryptfs.longname."):
+                testcase.append("%s.name" % filename)
+                expected.append("%s/<name>" % ("x" * i))
+
+            result = subprocess.check_output(["../gocryptfs-deobfuscate.py", ctlsock.name], input="\n".join(testcase).encode("utf-8"))
+            self.assertEqual(result.decode("utf-8").split("\n"), expected)
+
+            os.remove(os.path.join(plain.name, "x" * i))
+
+        subprocess.check_call(["fusermount", "-u", plain.name])
+
+        cipher.cleanup()
+        plain.cleanup()
 
 if __name__ == '__main__':
     unittest.main()
