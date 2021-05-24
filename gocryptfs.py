@@ -1,7 +1,7 @@
 #!/usr/bin/python3
-from Cryptodome.Protocol.KDF import HKDF
-from Cryptodome.Cipher import AES
-from Cryptodome.Hash import SHA256
+from Crypto.Protocol.KDF import HKDF
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256
 import itertools
 import argparse
 import getpass
