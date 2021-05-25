@@ -1,7 +1,4 @@
 #!/usr/bin/python3
-from Cryptodome.Protocol.KDF import HKDF
-from Cryptodome.Cipher import AES
-from Cryptodome.Hash import SHA256
 import itertools
 import argparse
 import getpass
@@ -12,6 +9,15 @@ import json
 import sys
 import io
 import os
+
+try:
+    from Cryptodome.Protocol.KDF import HKDF
+    from Cryptodome.Cipher import AES
+    from Cryptodome.Hash import SHA256
+except ImportError:
+    from Crypto.Protocol.KDF import HKDF
+    from Crypto.Cipher import AES
+    from Crypto.Hash import SHA256
 
 PLAINTEXT_ZERO = b"\x00" * 4096
 CIPHERTEXT_ZERO = b"\x00" * (4096 + 32)
