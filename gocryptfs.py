@@ -12,18 +12,20 @@ import os
 
 try:
     from Cryptodome.Protocol.KDF import HKDF
-    from Cryptodome.Cipher import AES
+    from Cryptodome.Cipher import AES, ChaCha20_Poly1305
     from Cryptodome.Hash import SHA256
 except ImportError:
     from Crypto.Protocol.KDF import HKDF
-    from Crypto.Cipher import AES
+    from Crypto.Cipher import AES, ChaCha20_Poly1305
     from Crypto.Hash import SHA256
 
 PLAINTEXT_ZERO = b"\x00" * 4096
-CIPHERTEXT_ZERO = b"\x00" * (4096 + 32)
+CIPHERTEXT_ZERO_AES = b"\x00" * (4096 + 32)
+CIPHERTEXT_ZERO_XCHACHA = b"\x00" * (4096 + 40)
 
 def decode_masterkey(masterkey):
     return bytes.fromhex(masterkey.replace("-", ""))
+
 
 class GocryptfsConfig:
     def __init__(self, filename=None, basepath=None):
@@ -58,7 +60,7 @@ class GocryptfsConfig:
                    context=b"AES-GCM file content encryption")
 
         assert len(block) > 32
-        assert block != CIPHERTEXT_ZERO
+        assert block != CIPHERTEXT_ZERO_AES
         # Layout: [ NONCE | CIPHERTEXT (...) |  TAG  ]
         nonce, tag, ciphertext = block[:16], block[-16:], block[16:-16]
         aes = AES.new(key, AES.MODE_GCM, nonce=nonce)
@@ -69,14 +71,31 @@ class GocryptfsConfig:
     def aessiv(self):
         return 'AESSIV' in self.config['FeatureFlags']
 
+    @property
+    def xchacha(self):
+        return 'XChaCha20Poly1305' in self.config['FeatureFlags']
+
+
 class GocryptfsFile:
-    def __init__(self, filename, masterkey, aessiv=False):
-        if aessiv:
-            self.decrypt_block = self.decrypt_siv_block
+    def __init__(self, filename, masterkey, aessiv: bool = False, xchacha: bool = False):
+        if aessiv and xchacha:
+            raise ValueError("aessiv and xchacha are mutually exclusive")
+
+        if xchacha:
+            self.block_size = 4096 + 40
+            self.decrypt_block = self.decrypt_xchacha20_poly1305_block
+            self.key = HKDF(masterkey, salt=b"", key_len=32, hashmod=SHA256,
+                            context=b"XChaCha20-Poly1305 file content encryption")
+
+        elif aessiv:
+            self.block_size = 4096 + 32
+            self.decrypt_block = self.decrypt_aes_siv_block
             self.key = HKDF(masterkey, salt=b"", key_len=64, hashmod=SHA256,
                             context=b"AES-SIV file content encryption")
+
         else:
-            self.decrypt_block = self.decrypt_gcm_block
+            self.block_size = 4096 + 32
+            self.decrypt_block = self.decrypt_aes_gcm_block
             self.key = HKDF(masterkey, salt=b"", key_len=32, hashmod=SHA256,
                             context=b"AES-GCM file content encryption")
 
@@ -95,10 +114,10 @@ class GocryptfsFile:
         self.blockno = 0
         self.remaining = io.BytesIO()
 
-    def decrypt_gcm_block(self, block):
+    def decrypt_aes_gcm_block(self, block):
         assert len(block) > 32
         # File holes are passed through to the underlying FS.
-        if block == CIPHERTEXT_ZERO:
+        if block == CIPHERTEXT_ZERO_AES:
             return PLAINTEXT_ZERO
         # Layout: [ NONCE | CIPHERTEXT (...) |  TAG  ]
         nonce, tag, ciphertext = block[:16], block[-16:], block[16:-16]
@@ -106,10 +125,10 @@ class GocryptfsFile:
         aes.update(struct.pack(">Q", self.blockno) + self.fileid)
         return aes.decrypt_and_verify(ciphertext, tag)
 
-    def decrypt_siv_block(self, block):
+    def decrypt_aes_siv_block(self, block):
         assert len(block) > 32
         # File holes are passed through to the underlying FS.
-        if block == CIPHERTEXT_ZERO:
+        if block == CIPHERTEXT_ZERO_AES:
             return PLAINTEXT_ZERO
         # Layout: [ NONCE |  TAG  | CIPHERTEXT (...) ]
         nonce, tag, ciphertext = block[:16], block[16:32], block[32:]
@@ -117,9 +136,20 @@ class GocryptfsFile:
         aes.update(struct.pack(">Q", self.blockno) + self.fileid)
         return aes.decrypt_and_verify(ciphertext, tag)
 
+    def decrypt_xchacha20_poly1305_block(self, block):
+        assert len(block) > 40
+        # File holes are passed through to the underlying FS.
+        if block == CIPHERTEXT_ZERO_XCHACHA:
+            return PLAINTEXT_ZERO
+        # Layout: [ NONCE |  CIPHERTEXT (...) | TAG ]
+        nonce, tag, ciphertext = block[:24], block[-16:], block[24:-16]
+        cipher = ChaCha20_Poly1305.new(key=self.key, nonce=nonce)
+        cipher.update(struct.pack(">Q", self.blockno) + self.fileid)
+        return cipher.decrypt_and_verify(ciphertext, tag)
+
     def fill_buffer(self):
-        self.fp.seek(18 + (4096 + 32) * self.blockno)
-        block = self.fp.read(4096 + 32)
+        self.fp.seek(18 + self.block_size * self.blockno)
+        block = self.fp.read(self.block_size)
         if len(block) == 0:
             self.remaining = io.BytesIO()
             return False
@@ -156,6 +186,7 @@ class GocryptfsFile:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Decrypt individual file from a gocryptfs volume")
     parser.add_argument('--aessiv', action='store_true', help="AES-SIV encryption")
+    parser.add_argument('--xchacha', action='store_true', help="XChaCha20-Poly1305 encryption")
     parser.add_argument('--masterkey', type=decode_masterkey, help="Masterkey as hex string representation")
     parser.add_argument('--password', help="Password to unlock config file")
     parser.add_argument('--config', help="Path to gocryptfs.conf configuration file")
@@ -168,8 +199,9 @@ if __name__ == '__main__':
             args.password = getpass.getpass('Password: ')
         args.masterkey = config.get_masterkey(args.password)
         args.aessiv = config.aessiv
+        args.xchacha = config.xchacha
 
-    fp = GocryptfsFile(args.filename, args.masterkey, args.aessiv)
+    fp = GocryptfsFile(args.filename, args.masterkey, args.aessiv, args.xchacha)
     while True:
         block = fp.read(4096)
         if len(block) == 0:

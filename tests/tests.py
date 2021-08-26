@@ -22,7 +22,7 @@ def generate_content():
     content = b"".join(blocks)
     return content
 
-def gocryptfs_encrypt(content, masterkey, aessiv):
+def gocryptfs_encrypt(content, masterkey, aessiv: bool = False, xchacha: bool = False):
     """Create an encrypted file with the given content."""
 
     cipher = tempfile.TemporaryDirectory(prefix="gocryptfs-cipher-")
@@ -36,6 +36,8 @@ def gocryptfs_encrypt(content, masterkey, aessiv):
     args = ["gocryptfs", "-q"]
     if aessiv:
         args.append("-aessiv")
+    if xchacha:
+        args.append("-xchacha")
     args.append("-masterkey=%s" % masterkey.hex())
     args.append("--")
     args.append(cipher.name)
@@ -81,8 +83,9 @@ def gocryptfs_encrypt(content, masterkey, aessiv):
 
 class GocryptfsConfigTests(unittest.TestCase):
     def test_masterkey(self):
-        config = gocryptfs.GocryptfsConfig("./gocryptfs.conf")
+        config = gocryptfs.GocryptfsConfig("./aesgcm/gocryptfs.conf")
         self.assertFalse(config.aessiv)
+        self.assertFalse(config.xchacha)
         masterkey = config.get_masterkey("test")
         self.assertEqual(masterkey, gocryptfs.decode_masterkey("fd890dab-86bf61cf-ec5ad460-ad3ed01f-9c52d546-2a31783d-a56b088d-3d05232e"))
 
@@ -147,16 +150,56 @@ class GocryptfsFileTests(unittest.TestCase):
         result = subprocess.check_output(["../gocryptfs.py", "--masterkey=%s" % masterkey.hex(), "--aessiv", file.name])
         self.assertEqual(result, b"")
 
+    def test_xchacha_random(self):
+        masterkey = os.urandom(32)
+
+        content = generate_content()
+        file = gocryptfs_encrypt(content, masterkey, xchacha=True)
+        fp = gocryptfs.GocryptfsFile(file.name, masterkey, xchacha=True)
+        self.assertEqual(fp.read(), content)
+        for _ in range(1000):
+            offset = random.randint(0, len(content) + 10)
+            size   = random.randint(0, len(content) + 10 - offset)
+            fp.seek(offset)
+            self.assertEqual(fp.read(size), content[offset:offset+size])
+        fp.close()
+
+        result = subprocess.check_output(["../gocryptfs.py", "--masterkey=%s" % masterkey.hex(), "--xchacha", file.name])
+        self.assertEqual(result, content)
+
+    def test_xchacha_empty(self):
+        masterkey = os.urandom(32)
+
+        file = gocryptfs_encrypt(b"", masterkey, xchacha=True)
+        fp = gocryptfs.GocryptfsFile(file.name, masterkey, xchacha=True)
+        self.assertEqual(fp.read(), b"")
+        fp.seek(4096)
+        self.assertEqual(fp.read(), b"")
+        fp.close()
+
+        result = subprocess.check_output(["../gocryptfs.py", "--masterkey=%s" % masterkey.hex(), "--xchacha", file.name])
+        self.assertEqual(result, b"")
+
+
 class GocryptfsTests(unittest.TestCase):
     def test_masterkey(self):
-        result = subprocess.check_output(["../gocryptfs.py", "--masterkey=fd890dab-86bf61cf-ec5ad460-ad3ed01f-9c52d546-2a31783d-a56b088d-3d05232e", "./mGj2_hdnHe34Sp0iIQUwuw"])
+        result = subprocess.check_output(["../gocryptfs.py", "--masterkey=fd890dab-86bf61cf-ec5ad460-ad3ed01f-9c52d546-2a31783d-a56b088d-3d05232e", "./aesgcm/mGj2_hdnHe34Sp0iIQUwuw"])
+        self.assertEqual(result, b"It works!\n")
+        result = subprocess.check_output(["../gocryptfs.py", "--xchacha", "--masterkey=42bd61fa-22725691-c259e2eb-0267e20b-cafc8692-608ae264-68274026-8a792306", "./xchacha/wZL8iobnvJUOrAiXuw1Ong"])
         self.assertEqual(result, b"It works!\n")
 
-    def test_config(self):
-        result = subprocess.check_output(["../gocryptfs.py", "--config=./gocryptfs.conf", "--password=test", "./mGj2_hdnHe34Sp0iIQUwuw"])
+    def test_config_aesgcm(self):
+        result = subprocess.check_output(["../gocryptfs.py", "--config=./aesgcm/gocryptfs.conf", "--password=test", "./aesgcm/mGj2_hdnHe34Sp0iIQUwuw"])
         self.assertEqual(result, b"It works!\n")
-        result = subprocess.check_output(["../gocryptfs.py", "--password=test", "./mGj2_hdnHe34Sp0iIQUwuw"])
+        result = subprocess.check_output(["../gocryptfs.py", "--password=test", "./aesgcm/mGj2_hdnHe34Sp0iIQUwuw"])
         self.assertEqual(result, b"It works!\n")
+
+    def test_config_xchacha(self):
+        result = subprocess.check_output(["../gocryptfs.py", "--config=./xchacha/gocryptfs.conf", "--password=test", "./xchacha/wZL8iobnvJUOrAiXuw1Ong"])
+        self.assertEqual(result, b"It works!\n")
+        result = subprocess.check_output(["../gocryptfs.py", "--password=test", "./xchacha/wZL8iobnvJUOrAiXuw1Ong"])
+        self.assertEqual(result, b"It works!\n")
+
 
 class GocryptfsDeobfuscateTests(unittest.TestCase):
     def test_wrong_sock(self):
